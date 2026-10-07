@@ -32,6 +32,22 @@ pi install npm:pi-warden
 
 Then `/warden enable` (paste a [TypeSafe](https://console.typesafe.ai) key) and `/warden init` (writes a starter `pi-warden.md`). That's it. No key? The offline guards still run.
 
+### Choose a judgment backend
+
+`typesafeBackend` is a **user-only** setting in `~/.pi/agent/pi-warden/config.json`; a project config cannot redirect judgments. It defaults to `"typesafe"`, which keeps the existing direct Jev endpoint path through pi-typesafe at `api.typesafe.ai` and does not start Docker. To use a local service, set one of these instead:
+
+```json
+{ "typesafeBackend": "kev" }
+```
+
+or `"laya"`. `/warden enable` is still required for consent. Docker with Compose must be installed; Warden lazily starts only the selected service on its first actual judgment. Compose startup and health readiness are bounded separately (up to 10 minutes). Jev and Kev use `timeoutMs`; Laya CPU inference uses the user-only `layaTimeoutMs` (default 60 seconds) after readiness. The host ports bind to loopback and are reachable by any local process: Kev at `127.0.0.1:3000`, Laya at `127.0.0.1:8100`. Compose receives the package-owned `docker/compose.env` explicitly, so it does not load `.env` from the consuming project. Set Kev and Laya variables in the process environment that starts Pi; that inherited environment takes precedence, and `compose.yaml` defaults apply when a variable is unset.
+
+Kev uses an OpenAI-compatible model provider. Set `KEV_OPENAI_API_KEY`; optionally set `KEV_OPENAI_BASE_URL` (default `https://api.openai.com/v1`) and `KEV_OPENAI_MODEL` (default `gpt-4o-mini`). Kev identifies itself as `kev-latest` by default (`KEV_MODEL` can change that). **Kev forwards judgment data to its configured model provider**, so review that provider's data handling before enabling it. `KEV_API_KEY` optionally requires authentication for local access to the Kev HTTP service; it is separate from the provider key.
+
+Laya stores its model cache in a persistent Docker volume. Its first start may take time while model weights download; set `HF_TOKEN` if a selected model requires it. If Laya logs a `choice:11+` calibration warning, current Warden questions do not use that bucket (the largest fixed choice has nine options; dynamic locators are capped at six); other Laya confidence is not thereby certified. `LAYA_API_KEY` optionally requires authentication for local access to the Laya HTTP service. Local service keys are separate from provider credentials, and `TYPESAFE_API_KEY` is not sent to either local service. The loopback ports are reachable by other local processes, so enable a local backend only on a machine where you trust those processes. Compose uses a hashed project name for each effective destination and service configuration, so different configurations cannot replace each other's containers. They still use the same fixed loopback ports: if another project owns a port, startup fails instead of routing judgments to the other configuration. To stop one project after Warden exits, find its name with `docker compose ls`, then, from the pi-warden package directory, run `docker compose --project-name <listed-project-name> --env-file docker/compose.env -f docker/compose.yaml stop kev` (or replace `kev` with `laya`). Use `stop`, not `down -v`, to preserve Laya's persistent model cache.
+
+Consent is tied to the selected destination. Older consent for Kev, Laya, or a custom remote endpoint did not record that destination, so those configurations require one-time re-consent with `/warden enable`; legacy consent for the default Jev/TypeSafe endpoint remains valid.
+
 ## It steers. It doesn't nag.
 
 Most guardrails stop and ask you. pi-warden tells **the agent** what it got wrong, and the agent corrects itself. You are pulled in only when something can't be undone. In a replay of 18,075 recorded calls (2026-09-21), **0.27% were held at the old 0.7 threshold and 0.1% at 0.9**, the default since 0.75.0 ([report](eval/reports/2026-09-21-calibration-0.33.3/report.md)).

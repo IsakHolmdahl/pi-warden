@@ -1,0 +1,8 @@
+FROM node:20-slim
+RUN npm install --global @kev-ai/server@1.0.0
+ENV KEV_HOST=0.0.0.0
+ENV KEV_PORT=3000
+ENV KEV_BACKEND=openai
+ENV KEV_OPENAI_MODEL=gpt-4o-mini
+EXPOSE 3000
+CMD ["kev-server"]

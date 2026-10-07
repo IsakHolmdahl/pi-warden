@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { writeFileAtomicSync } from "./atomic.js";
 import type { JudgmentBackend } from "./backend.js";
-import { resolveJudgmentBackend } from "./backend.js";
+import { parseConsentTarget, resolveJudgmentBackend } from "./backend.js";
+import type { TypesafeConsentTarget } from "./backend.js";
 import { defaultHostDirs } from "./host-dirs.js";
 import type { HostDirs } from "./host-dirs.js";
 import { COMMAND_TOOLS } from "./tools.js";
@@ -457,9 +458,11 @@ export interface ConscienceConfig {
 export interface WardenConfig {
   /** Master switch. false disables every guard, including offline pattern checks. */
   enabled: boolean;
-  /** Consent to send task and action summaries to api.typesafe.ai. Set by /warden enable; never by a project file. */
+  /** Consent to send task and action summaries to the selected judgment destination; never by a project file. */
   typesafe: boolean;
-  /** The decisions service the judgments go to: a name ("typesafe", "openrouter", "commandcode") or a caller-supplied endpoint object. User file only: a project must not redirect judgments to another vendor. Undefined when the configured value was refused. */
+  /** Sanitized destination covered by typesafe consent. Missing targets are legacy consent only for the default Jev path. */
+  typesafeConsentTarget: TypesafeConsentTarget | undefined;
+  /** Where judgments go: a pi-typesafe backend, a caller-supplied endpoint, or local "kev"/"laya" service. User file only; project config cannot redirect judgments. Undefined when refused. */
   typesafeBackend: JudgmentBackend | undefined;
   /** Why the configured typesafeBackend was refused: judgments stay off, and the once-per-session notice and /warden status quote this. */
   backendRefusal: string | undefined;
@@ -469,8 +472,10 @@ export interface WardenConfig {
    * PI_WARDEN_MODE overrides it.
    */
   mode: WardenMode;
-  /** Per-request TypeSafe timeout for every guard. */
+  /** Per-request TypeSafe timeout for Jev/Kev and the default for other backends. */
   timeoutMs: number;
+  /** Per-request timeout when the local Laya backend is selected; user file only. */
+  layaTimeoutMs: number;
   /** Maximum TypeSafe requests per session across all guards. */
   maxRequests: number;
   action: ActionGuardConfig;
@@ -515,17 +520,19 @@ export interface WardenConfig {
 
 export const PACKAGE_NAME = "pi-warden";
 /** Bumped when WardenConfig gains a section; extension.ts checks it so a half-updated module graph is reported, not crashed on. */
-export const CONFIG_SCHEMA = 12;
+export const CONFIG_SCHEMA = 14;
 export const PROJECT_CONFIG_FILE = `${PACKAGE_NAME}.json`;
 
 export function defaultConfig(): WardenConfig {
   return {
     enabled: true,
     typesafe: false,
+    typesafeConsentTarget: undefined,
     typesafeBackend: "typesafe",
     backendRefusal: undefined,
     mode: "steer",
     timeoutMs: 5000,
+    layaTimeoutMs: 60_000,
     maxRequests: 500,
     action: {
       enabled: true,
@@ -1090,14 +1097,19 @@ export function applyUserOverrides(base: WardenConfig, raw: unknown): WardenConf
   const warnings: string[] = removedKeyWarnings(raw, "user");
   const shared = applyShared(base, raw);
   const backend = resolveJudgmentBackend(raw.typesafeBackend);
+  const consentTarget = raw.typesafeConsentTarget === undefined
+    ? base.typesafeConsentTarget
+    : parseConsentTarget(raw.typesafeConsentTarget) ?? { backend: "", host: "", fingerprint: "" }; // Invalid is distinct from legacy absence.
   const guards = applyGuards(base, raw, shared.timeoutMs, "user", warnings);
   return {
     enabled: boolean(raw.enabled, base.enabled),
     typesafe: boolean(raw.typesafe, base.typesafe),
+    typesafeConsentTarget: consentTarget,
     typesafeBackend: backend.typesafeBackend,
     backendRefusal: backend.backendRefusal,
     mode: isMode(raw.mode) ? raw.mode : base.mode,
     ...shared,
+    layaTimeoutMs: positiveInteger(raw.layaTimeoutMs, base.layaTimeoutMs),
     ...guards,
     widget: applyWidget(base.widget, raw.widget),
     steerVisible: boolean(raw.steerVisible, base.steerVisible),
@@ -1244,9 +1256,14 @@ export function writeUserConfig(raw: Json, dirs: HostDirs = defaultHostDirs()): 
   return path;
 }
 
+/** Atomically persists related top-level settings without disturbing the rest of the user file. */
+export function setUserSettings(settings: Json, dirs: HostDirs = defaultHostDirs()): string {
+  return writeUserConfig({ ...readUserConfig(dirs), ...settings }, dirs);
+}
+
 /** Persists one top-level user setting without disturbing the rest of the file. */
 export function setUserSetting(key: "typesafe" | "enabled" | "mode", value: boolean | WardenMode, dirs: HostDirs = defaultHostDirs()): string {
-  return writeUserConfig({ ...readUserConfig(dirs), [key]: value }, dirs);
+  return setUserSettings({ [key]: value }, dirs);
 }
 
 export function setNestedValue(obj: Record<string, unknown>, path: string, value: unknown): Record<string, unknown> {

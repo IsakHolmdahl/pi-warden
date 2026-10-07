@@ -1,4 +1,5 @@
-import { ask, choice, chunkEvaluationRequest, noul } from "pi-typesafe";
+import { choice, chunkEvaluationRequest, noul } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { IntegrationErrorCode, Judge, JsonValue, Questions, SystemOneRequest } from "pi-typesafe";
 import { redact } from "./redact.js";
 import type { Rule, RuleSet } from "./rules.js";

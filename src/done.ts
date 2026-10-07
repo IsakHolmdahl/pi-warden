@@ -1,5 +1,6 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import { ask, choice, noul } from "pi-typesafe";
+import { choice, noul } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { IntegrationErrorCode, Judge } from "pi-typesafe";
 import type { DoneGuardConfig, VisualToolsConfig } from "./config.js";
 import { isReadOnlyCommand, stripDataText } from "./guard.js";

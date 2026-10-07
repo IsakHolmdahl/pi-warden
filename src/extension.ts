@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { join, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
@@ -10,11 +11,13 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import * as tuiModule from "@earendil-works/pi-tui";
 type MouseRegionConstructor = new (child: ReturnType<typeof statusWidget>, onMouse: (event: { type: string; button: string }) => { handled: boolean } | undefined) => import("@earendil-works/pi-tui").Component;
 const MouseRegion: MouseRegionConstructor | undefined = (tuiModule as Partial<{ MouseRegion: MouseRegionConstructor }>).MouseRegion;
-import { authState, backendHost, createTypeSafe, describeAuth, resolveBackend, ask } from "pi-typesafe";
+import { authState, createTypeSafe, describeAuth, resolveBackend } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { TypeSafe } from "pi-typesafe";
 import { ensureApiKey } from "pi-typesafe/ui";
-import { backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey } from "./backend.js";
+import { backendKeyEnv, backendName, consentTargetForBackend, consentTargetMatches, describeBackend, disclosureFor, isLocalBackend, judgmentBackendHost, judgeOptions, loginStoresKey } from "./backend.js";
 import type { BackendSetting, JudgmentsOffReason } from "./backend.js";
+import { createLocalBackend, createLocalJudgmentClient } from "./local-backend.js";
 import { ActionGuard } from "./action-guard.js";
 import { adaptHost } from "./host-compat.js";
 import { assistantView, formatMuted, NEVER_MUTED, STEER_KINDS, SteerStats, SteerWatch, steerStatsPath } from "./adaptive.js";
@@ -22,7 +25,7 @@ import type { SteerKind, SteerSubject } from "./adaptive.js";
 import type { ToolCallRef } from "./action-guard.js";
 import { ArmingTracker, unparseableArmingRules } from "./arming.js";
 import * as configModule from "./config.js";
-import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, setUserSetting, userConfigPath, writeUserConfig } from "./config.js";
+import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, setUserSetting, setUserSettings, userConfigPath, writeUserConfig } from "./config.js";
 import type { WardenConfig, WardenMode } from "./config.js";
 import { classifyToolResult, doneNudge, emptyEvidence, evaluateDone, finalAssistantText, formatDone, isVisualCheck, needsDoneCheck, recordOutcome as recordDoneOutcome, recordUi } from "./done.js";
 import type { RunEvidence } from "./done.js";
@@ -95,6 +98,13 @@ import { statusWidget } from "./widget-render.js";
 export const disclosure = "With TypeSafe judgments enabled, pi-warden sends to api.typesafe.ai: your latest request, the task spine it is judged against (the first request of the thread and up to four redacted earlier requests), plus a redacted, truncated summary of each guarded bash, write, or edit call before it runs, with the agent's own words from the message that makes the call (its stated plan); one judged action call in twenty (`action.traceSample`, default 0.05) also sends a second request for diagnostics that carries up to eight redacted earlier user/assistant text messages and the resolved active rules file content (pi-warden.md, the configured files, or README/CLAUDE/AGENTS as fallback, token-aware truncated at ~4000 tokens); on every other call that rules content rides the acting request only while a rule violation is open on the call; none of it is sent unless the rules guard is on (`rules.enabled: false` keeps it on this machine); for a write or edit (or a bash command that writes a file with its content in the command) in a project with a rules file (pi-warden.md, the configured files, or README/CLAUDE/AGENTS as fallback), a larger redacted sample of the written content with the current file around each edit and the rule text; the last few tool calls and output tails when the agent keeps failing; the agent's final message when it reports completion without running checks; redacted tool-output samples for security and context saving (retention and output format); with the context filter on (`context.filter`, off by default), the redacted text of a large tool output in chunks, with the call's command and the agent's stated plan; before each new user message, when the rules guard is on (except for a short continuation or a relayed child report, which send nothing), your new request (1500 redacted characters), the same task spine, and every rule of the active rules source (each rule's heading, its text clipped at 300 characters, and its `paths:` scope), one question per rule, so Jev can say which of them apply; a redacted sample of an async subagent report that names a failure, a stop, or a question, with your latest request, when warden decides whether that report should wake the agent; on the first guarded call after your reply, the redacted summaries of the calls allowed in the previous turn, so Jev can say whether your reply regrets one of them; and, only for a call that is held after an earlier hold, once your reply came in, one approval request with your reply, up to 3000 redacted characters of the agent's text in the turn before it (every assistant message after your previous message), the redacted call summary, and the reasons for the hold (pattern names and scores), so Jev can say whether your reply approves that call. With relevance compaction on (`compaction.enabled`, off by default), at each compaction: the same latest request and task spine, a redacted outline of the conversation being compacted (user and assistant text clipped, one line per tool call), and for each tool call, extension message, and earlier-summary part a redacted 500-character input and a 1100-character head/tail sample, so Jev can say which to keep word for word. For the conscience coach (recommend mode): your current request (2000 redacted characters), the same task spine (the first request of the thread and up to four redacted earlier requests), up to four recent user/assistant text messages (500 redacted characters each with roles), and sanitized candidate metadata (skill/tool name, role, lead, useWhen, examples when an index entry matches; bare description otherwise; full skill instructions never go to Jev). The index is built locally by the session model; only sanitized entries reach Jev; advertised locations never do. Compression and duplicate notes store an exact, owner-only copy in a temporary file on this machine; the hold feedback log stores tool names, pattern ids, scores, and outcomes (never commands) in an owner-only file under Pi's agent directory; an owner-only SQLite database under Pi's agent directory stores redacted hold context (plan, summary, redacted command preview, outcomes) for held and judged-allowed calls, for learning and retention (a hold is kept 365 days and an allowed call 90, both configurable). Requests may incur charges. Secret redaction is best-effort. Results are model judgments, not proof or authorization; offline pattern checks stay active either way.";
 
 const WIDGET = PACKAGE_NAME;
+const LOCAL_READINESS_TIMEOUT_MS = 10 * 60_000;
+type WardenJudge = Pick<TypeSafe, "evaluate" | "getUsage"> & { getSpend(): { caps: { maxRequests?: number } } };
+
+function runLocalCompose(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => execFile(command, args, { timeout: LOCAL_READINESS_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024 }, error => error ? reject(error) : resolve()));
+}
+
 const CONFIRM_TEXT_LIMIT = 500;
 
 /** Which guard spent the user's attention. The status line reports one count per guard. */
@@ -251,9 +261,9 @@ function planForCall(entries: ReturnType<ExtensionContext["sessionManager"]["get
  */
 export function judgmentsOffText(reason: Exclude<JudgmentsOffReason, "budget">, setting: BackendSetting, headless: boolean, rejectedEnv?: string): string {
   switch (reason) {
-    case "no_consent": return `warden: Jev judgments are off (no consent). ${headless ? "Set PI_WARDEN_ENABLED=1." : "Run /warden enable."}`;
+    case "no_consent": return `warden: ${setting.typesafeBackend && isLocalBackend(setting.typesafeBackend) ? `${backendName(setting.typesafeBackend)} local judgments` : "Jev judgments"} are off (no consent). ${headless ? "Set PI_WARDEN_ENABLED=1." : "Run /warden enable."}`;
     case "bad_backend": return `warden: Jev judgments are off (typesafeBackend refused: ${setting.backendRefusal ?? "the configured value is not usable"})`;
-    case "no_key": return `warden: Jev judgments are off (no key for ${backendName(setting.typesafeBackend)}). Set ${resolveBackend(setting.typesafeBackend).keyEnv}${loginStoresKey(setting.typesafeBackend) ? " or run /typesafe login" : ""}.`;
+    case "no_key": return `warden: Jev judgments are off (no key for ${backendName(setting.typesafeBackend)}). Set ${backendKeyEnv(setting.typesafeBackend)}${loginStoresKey(setting.typesafeBackend) ? " or run /typesafe login" : ""}.`;
     case "key_rejected": return rejectedEnv
       ? `warden: Jev judgments are off (the key in ${rejectedEnv} was rejected). Check the key, then run /warden status.`
       : "warden: Jev judgments are off (the key saved by /typesafe login was rejected). Run /typesafe login.";
@@ -409,7 +419,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   // check; there is no module state. A question-wording change breaks the hash test and the gate
   // fail-closes (no delivery) until the policy is re-measured.
   const consciencePolicy = CONSCIENCE_BETA_POLICY;
-  let client: TypeSafe | undefined;
+  let client: WardenJudge | undefined;
   const cooldown = new JudgeCooldown();
   let judgeConfig: WardenConfig | undefined;
   /** Where cooldown notices go; unset headless, where a failure is already silent (see noteError). */
@@ -572,7 +582,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
   // Config values that were not applied as written: said once per session; /warden status repeats them.
   let configWarningsReported = false;
   const configFor = (ctx: ExtensionContext | ExtensionCommandContext): WardenConfig => {
-    const { config, missing } = guardCurrentSections(completeConfig(loadConfig({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted(), dirs })));
+    const { config: loaded, missing } = guardCurrentSections(completeConfig(loadConfig({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted(), dirs })));
+    const config = loaded.typesafeBackend === "laya"
+      ? { ...loaded, timeoutMs: loaded.layaTimeoutMs, action: { ...loaded.action, timeoutMs: loaded.layaTimeoutMs } }
+      : loaded;
     if (missing.length && !shapeReported) {
       shapeReported = true;
       // A namespace read stays undefined (not a link error) when an older config module lacks the export.
@@ -607,7 +620,13 @@ export default function wardenExtension(host: ExtensionAPI): void {
     arming.updateRules(config.action.armingRules);
     return config;
   };
-  const consentGiven = (config: WardenConfig) => config.typesafe || process.env.PI_WARDEN_ENABLED === "1";
+  const hasStoredConsent = (config: WardenConfig): boolean => {
+    if (!config.typesafe) return false;
+    const target = consentTargetForBackend(config.typesafeBackend);
+    if (config.typesafeConsentTarget === undefined) return config.typesafeBackend === "typesafe";
+    return consentTargetMatches(config.typesafeConsentTarget, target);
+  };
+  const consentGiven = (config: WardenConfig) => hasStoredConsent(config) || process.env.PI_WARDEN_ENABLED === "1";
   /** Why no judge is available, or undefined when one is. The notice, the trace file, and the conscience all use it. */
   const judgmentsOffReason = (config: WardenConfig): JudgmentsOffReason | undefined => {
     // A refused backend is a config error the user must see even before consent or keys matter.
@@ -615,6 +634,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     if (config.backendRefusal !== undefined || backend === undefined) return "bad_backend";
     if (!consentGiven(config)) return "no_consent";
     if (budgetExhausted) return "budget";
+    if (isLocalBackend(backend)) return undefined;
     const auth = authState({ backend });
     if (auth.usable) return undefined;
     // No key in effect, or one whose last request came back 401 or 403.
@@ -630,12 +650,13 @@ export default function wardenExtension(host: ExtensionAPI): void {
     // The budget has its own notice in noteError.
     if (reason === undefined || reason === "budget" || judgmentsReported.has(reason)) return;
     judgmentsReported.add(reason);
-    const auth = reason === "key_rejected" && config.typesafeBackend !== undefined ? authState({ backend: config.typesafeBackend }) : undefined;
+    const backend = config.typesafeBackend;
+    const auth = reason === "key_rejected" && backend !== undefined && !isLocalBackend(backend) ? authState({ backend }) : undefined;
     judgmentsNotify?.(judgmentsOffText(reason, config, judgmentsHeadless, auth?.kind === "environment" ? auth.keyName : undefined));
   };
-  const consentSource = (config: WardenConfig) => config.typesafe ? "/warden enable" : process.env.PI_WARDEN_ENABLED === "1" ? "PI_WARDEN_ENABLED" : undefined;
+  const consentSource = (config: WardenConfig) => hasStoredConsent(config) ? "/warden enable" : process.env.PI_WARDEN_ENABLED === "1" ? "PI_WARDEN_ENABLED" : undefined;
   /** A consent flag is not proof that judgments happen; check the key state for the chosen backend. */
-  const judgeFor = (config: WardenConfig): TypeSafe | undefined => {
+  const judgeFor = (config: WardenConfig): WardenJudge | undefined => {
     const off = judgmentsOffReason(config);
     noteJudgments(config, off);
     if (off) return undefined;
@@ -647,7 +668,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
     // Reached only if a config ever sets no backend and no refusal at once; treating it as off keeps the invariant.
     if (backend === undefined) return undefined;
     try {
-      client = watched(createTypeSafe(judgeOptions({ maxRequests: config.maxRequests, timeoutMs: config.timeoutMs, typesafeBackend: backend })));
+      if (isLocalBackend(backend)) {
+        const runtime = createLocalBackend({ backend, runProcess: runLocalCompose, fetch: globalThis.fetch, readinessTimeoutMs: LOCAL_READINESS_TIMEOUT_MS, requestTimeoutMs: config.timeoutMs });
+        client = watched(createLocalJudgmentClient(runtime, config.maxRequests));
+      } else client = watched(createTypeSafe(judgeOptions({ maxRequests: config.maxRequests, timeoutMs: config.timeoutMs, typesafeBackend: backend })));
     } catch (error) {
       // An endpoint the config accepts can still be unusable (one that names no defaultModel); a hook must never crash.
       const message = error instanceof Error ? error.message : String(error);
@@ -661,7 +685,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     return client;
   };
   /** Every guard reaches the backend through `evaluate`, so this one seam sees each failure and each success. */
-  const watched = (typesafe: TypeSafe): TypeSafe => new Proxy(typesafe, {
+  const watched = (typesafe: WardenJudge): WardenJudge => new Proxy(typesafe, {
     get(target, prop, receiver) {
       if (prop !== "evaluate") return Reflect.get(target, prop, receiver);
       return async (...args: Parameters<TypeSafe["evaluate"]>) => {
@@ -682,7 +706,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     if (event.type === "recovered") { noticeUi.notify("warden: judgments resumed.", "info"); return; }
     const seconds = Math.round(event.ms / 1000);
     const remedy = event.kind === "auth"
-      ? ` Set ${resolveBackend(judgeConfig?.typesafeBackend).keyEnv} or run /warden enable.`
+      ? ` Set ${backendKeyEnv(judgeConfig?.typesafeBackend)} or run /warden enable.`
       : event.kind === "configuration" ? " /warden status shows the backend setup." : "";
     noticeUi.notify(`warden: judgments paused for ${seconds}s after a ${event.kind} failure; pattern checks run alone until then.${remedy}`, "warning");
   };
@@ -2820,8 +2844,11 @@ export default function wardenExtension(host: ExtensionAPI): void {
         if (action === "status") {
           // A refused backend has no key to describe; the refusal itself is the status line.
           const backend = config.typesafeBackend;
-          const auth = config.backendRefusal !== undefined || backend === undefined ? undefined : describeAuth(authState({ backend }));
+          const auth = config.backendRefusal !== undefined || backend === undefined
+            ? undefined
+            : isLocalBackend(backend) ? { text: "local service; no Jev key required" } : describeAuth(authState({ backend }));
           const source = consentSource(config);
+          const judgeLabel = backend && isLocalBackend(backend) ? `${backend} local` : "TypeSafe";
           const usage = client?.getUsage();
           const guards = [config.action.enabled && "action", config.stuck.enabled && "stuck", config.done.enabled && "done-check", config.slop.enabled && "slop", config.slop.enabled && config.slop.prose.enabled && `prose (${config.slop.prose.audience})`, config.security.enabled && "security", config.rules.enabled && "rules", config.context.enabled && "context", config.runaway.enabled && "runaway", config.subagent.enabled && "subagent triage", config.notify.enabled && "desktop notifications"].filter(Boolean).join(", ");
           const ls = await holdStats(ctx.cwd, dirs);
@@ -2829,7 +2856,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
             ? `Lifetime here: ${ls.held} hold${ls.held === 1 ? "" : "s"}, not yet measurable (${ls.allowed} allowed).`
             : `Lifetime here: ${ls.held} hold${ls.held === 1 ? "" : "s"}, ${ls.labeled} labeled, ${ls.declined + ls.replanned} stood (${ls.declined + ls.replanned}/${ls.labeled}), ${ls.abandoned} abandoned, ${ls.allowed} allowed (${ls.accepted} accepted, ${ls.regretted} regretted).`;
           report([
-            `pi-warden: ${config.enabled ? `guarding ${config.action.tools.join(", ")} (${guards})` : "off"}; mode ${activeMode(config, ctx.hasUI)}; TypeSafe judgments ${source ? `consented via ${source}` : "not consented (run /warden enable)"}${config.backendRefusal !== undefined || backend === undefined || backend === "typesafe" ? "" : ` (${describeBackend(backend)})`}; ${config.backendRefusal !== undefined ? `judgments are off: typesafeBackend refused: ${config.backendRefusal}` : auth?.text ?? ""}`,
+            `pi-warden: ${config.enabled ? `guarding ${config.action.tools.join(", ")} (${guards})` : "off"}; mode ${activeMode(config, ctx.hasUI)}; ${judgeLabel} judgments ${source ? `consented via ${source}` : "not consented (run /warden enable)"}${config.backendRefusal !== undefined || backend === undefined || backend === "typesafe" ? "" : ` (${describeBackend(backend)})`}; ${config.backendRefusal !== undefined ? `judgments are off: typesafeBackend refused: ${config.backendRefusal}` : auth?.text ?? ""}`,
             `Session: ${stats.inspected} inspected, ${stats.judged} judged, ${stats.warned} warned, ${stats.held} held, ${stats.approved} approved on retry, ${stats.offPlan} off plan (${stats.offPlanTraceOnly} trace-only), ${stats.offTask} off task, ${stats.slop} slop notes, ${stats.ruleViolations}/${stats.ruleChecks} rule violations, ${stats.pathNotes} sensitive-path notes, ${stats.stuck}/${stats.stuckChecks} stuck, ${stats.unverified}/${stats.doneChecks} unverified done, ${stats.proseNudges}/${stats.proseChecks} prose nudges, ${stats.runaway} runaway stops, ${stats.subagentWoken}/${stats.subagentReports} subagent reports woken, ${stats.restatements} restatements, ${stats.errors} TypeSafe errors, ${stats.cooldownSkips} checks without Jev during a judge cooldown; ${usage?.requestsStarted ?? 0}/${config.maxRequests} requests. Steers are ${config.steerVisible ? "shown in the transcript" : "hidden from the transcript (trace panel shows them)"}. Steer budget: ${config.steerBudget === 0 ? "off" : `${config.steerBudget} per run`}.`,
             formatSteers(stats),
             `${formatMuted(steerStats.muted(), config.steers)}${stats.steersMuted ? ` This session: ${stats.steersMuted} steer${stats.steersMuted === 1 ? "" : "s"} kept in the trace only.` : ""}`,
@@ -2859,7 +2886,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
           const result = await runRulesAudit({
             cwd: ctx.cwd, paths: parsed.paths, max: parsed.max, yes: parsed.yes, config: config.rules,
             set: rulesGuard.store.load(ctx.cwd, config.rules), judge, timeoutMs: config.timeoutMs, signal: ctx.signal,
-            destination: backendHost(config.typesafeBackend),
+            destination: judgmentBackendHost(config.typesafeBackend),
             confirm: ctx.hasUI ? (title, body) => ctx.ui.confirm(title, body, ctx.signal ? { signal: ctx.signal } : {}) : undefined,
           });
           switch (result.status) {
@@ -2868,7 +2895,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
               report(`Rules audit sent nothing: Jev judgments are off${off === "budget" ? " (the request budget is used up)" : ""}.${off && off !== "budget" ? ` ${judgmentsOffText(off, config, !ctx.hasUI)}` : ""}`);
               return;
             case "no-files": report(`Rules audit sent nothing: ${result.reason}.`); return;
-            case "needs-yes": report(`Rules audit sent nothing: a headless run needs --yes before ${result.files} file samples go to ${backendHost(config.typesafeBackend)} (${result.leftOut} more files left out at the --max ${parsed.max} cap).`, "warning"); return;
+            case "needs-yes": report(`Rules audit sent nothing: a headless run needs --yes before ${result.files} file samples go to ${judgmentBackendHost(config.typesafeBackend)} (${result.leftOut} more files left out at the --max ${parsed.max} cap).`, "warning"); return;
             case "cancelled": report("Rules audit cancelled. Nothing was sent."); return;
             case "done": report(formatRulesAudit(result.outcome)); return;
           }
@@ -3077,24 +3104,30 @@ export default function wardenExtension(host: ExtensionAPI): void {
         if (action === "enable") {
           if (config.backendRefusal !== undefined) { report(`Cannot enable judgments: typesafeBackend refused: ${config.backendRefusal} Fix the value in ${userConfigPath(dirs)}, then run /warden enable again.`, "warning"); return; }
           const backend = config.typesafeBackend;
-          if (!ctx.hasUI) { report(`Consent needs an interactive session. For headless runs set PI_WARDEN_ENABLED=1 and ${resolveBackend(backend).keyEnv} explicitly.`, "warning"); return; }
+          const target = consentTargetForBackend(backend);
+          if (!ctx.hasUI) { report(`Consent needs an interactive session. For headless runs set PI_WARDEN_ENABLED=1${backend && isLocalBackend(backend) ? "" : ` and ${resolveBackend(backend).keyEnv} explicitly`}.`, "warning"); return; }
           // For a non-TypeSafe backend the dialog names who answers: the label, host, and model sent.
           const consentText = backend === undefined || backend === "typesafe"
             ? disclosure
             : `Judgments go to ${describeBackend(backend)}. ${disclosureFor(backend, disclosure)}`;
-          if (!await ctx.ui.confirm("Enable TypeSafe judgments for pi-warden?", consentText)) return;
+          const consentTitle = backend && isLocalBackend(backend) ? `Enable ${backend} judgments for pi-warden?` : "Enable TypeSafe judgments for pi-warden?";
+          if (!await ctx.ui.confirm(consentTitle, consentText)) return;
           // One flow: consent, then a key if none is configured yet. TypeSafe prompts, verifies, and stores the key for every
           // pi-typesafe consumer; any other backend has no login, so a missing key is reported with the variable to set.
-          const key = await ensureApiKey(ctx, backend === undefined ? {} : { backend });
-          if (!key) { report("No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.", "warning"); return; }
-          const path = setUserSetting("typesafe", true, dirs);
+          const key = backend && isLocalBackend(backend) ? undefined : await ensureApiKey(ctx, backend === undefined ? {} : { backend });
+          if ((!backend || !isLocalBackend(backend)) && !key) { report("No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.", "warning"); return; }
+          if (target === undefined || !consentTargetMatches(target, consentTargetForBackend(backend))) {
+            report("The judgment destination changed during consent. Review it and run /warden enable again.", "warning");
+            return;
+          }
+          const path = setUserSettings({ typesafe: true, typesafeConsentTarget: target }, dirs);
           client = undefined;
           budgetExhausted = false;
-          report(`TypeSafe judgments enabled and saved to ${path}${key.login ? `; key verified (${key.login.models} model${key.login.models === 1 ? "" : "s"}) and stored at ${key.login.path}` : ` using the ${key.source === "stored" ? "stored key" : `key from ${resolveBackend(config.typesafeBackend).keyEnv}`}`}. This stays on in new sessions until /warden disable.`);
+          report(`${backend && isLocalBackend(backend) ? `${backend} local judgments` : "TypeSafe judgments"} enabled and saved to ${path}${key?.login ? `; key verified (${key.login.models} model${key.login.models === 1 ? "" : "s"}) and stored at ${key.login.path}` : key ? ` using the ${key.source === "stored" ? "stored key" : `key from ${backendKeyEnv(config.typesafeBackend)}`}` : "; no Jev key is sent to the local service"}. This stays on in new sessions until /warden disable.`);
           return;
         }
         if (action === "disable") {
-          const path = setUserSetting("typesafe", false, dirs);
+          const path = setUserSettings({ typesafe: false, typesafeConsentTarget: undefined }, dirs);
           report(`TypeSafe judgments disabled in ${path}. Offline pattern checks stay active; set enabled to false there to turn pi-warden off entirely.`);
           return;
         }
@@ -3203,7 +3236,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
           const judge = judgeFor(config);
           // For a non-TypeSafe backend the confirmation names who answers: the label, host, and model sent.
           const backend = config.typesafeBackend;
-          const destination = backend === undefined || backend === "typesafe" ? backendHost(backend) : describeBackend(backend);
+          const destination = backend === undefined || backend === "typesafe" ? judgmentBackendHost(backend) : describeBackend(backend);
           if (judge && ctx.hasUI && !await ctx.ui.confirm("Send one synthetic pi-warden test request?", `A synthetic action ("rm -rf /var/tmp/pi-warden-demo" for the task "Prepare the demo environment") goes to ${destination} and may incur charges. ${disclosureFor(config.typesafeBackend, disclosure)}`)) return;
           const verdict = await evaluateAction(
             { tool: "bash", input: { command: "rm -rf /var/tmp/pi-warden-demo" }, cwd: ctx.cwd, task: "Prepare the demo environment" },

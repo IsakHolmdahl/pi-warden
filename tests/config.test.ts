@@ -6,6 +6,7 @@ import { after, before, test } from "node:test";
 import { ArmingTracker } from "../src/arming.js";
 import { applyProjectOverrides, applyUserOverrides, defaultConfig, loadConfig, setUserSetting, userConfigPath } from "../src/config.js";
 import { completeConfig } from "../src/shape.js";
+import { consentTargetForBackend } from "../src/backend.js";
 
 let temporary: string;
 let project: string;
@@ -38,6 +39,16 @@ test("defaults: guards on, steer mode, TypeSafe consent off, nudges on", () => {
   assert.equal(config.steerVisible, false, "steers are hidden from the transcript by default; the trace shows them");
   assert.equal(config.notices, false, "per-call warning notices are hidden from the transcript by default");
   assert.equal(config.timeoutMs, config.action.timeoutMs);
+  assert.equal(config.layaTimeoutMs, 60_000, "Laya gets a longer local-inference deadline by default");
+});
+
+test("Laya timeout is user-only and rejects invalid values", () => {
+  const base = defaultConfig();
+  const user = applyUserOverrides(base, { layaTimeoutMs: 90_000 });
+  assert.equal(user.layaTimeoutMs, 90_000);
+  assert.equal(user.timeoutMs, 5000, "Laya timeout does not alter the shared Jev/Kev timeout");
+  assert.equal(applyUserOverrides(base, { layaTimeoutMs: -1 }).layaTimeoutMs, 60_000);
+  assert.equal(applyProjectOverrides(base, { layaTimeoutMs: 10_000 }).layaTimeoutMs, 60_000);
 });
 
 test("should-proceed steer parser accepts booleans and defaults invalid or missing values", () => {
@@ -299,9 +310,34 @@ test("arming rules parse duration strings and numbers", () => {
   assert.equal(config.action.armingRules[4]!.arms.for, 600_000, "default is 10 minutes");
 });
 
-test("defaults: typesafeBackend is typesafe", () => {
+test("defaults: current Jev/TypeSafe backend remains selected", () => {
   assert.equal(defaultConfig().typesafeBackend, "typesafe");
   assert.equal(defaultConfig().backendRefusal, undefined);
+});
+
+test("user override selects Kev", () => {
+  const config = applyUserOverrides(defaultConfig(), { typesafeBackend: "kev" });
+  assert.equal(config.typesafeBackend, "kev");
+  assert.equal(config.backendRefusal, undefined);
+});
+
+test("user override selects Laya", () => {
+  const config = applyUserOverrides(defaultConfig(), { typesafeBackend: "laya" });
+  assert.equal(config.typesafeBackend, "laya");
+  assert.equal(config.backendRefusal, undefined);
+});
+
+test("user config retains a backend-bound consent target; a project cannot redirect it", () => {
+  const target = consentTargetForBackend("kev");
+  const user = applyUserOverrides(defaultConfig(), { typesafe: true, typesafeBackend: "kev", typesafeConsentTarget: target });
+  const field = (config: object) => (config as Record<string, unknown>).typesafeConsentTarget;
+  assert.deepEqual(field(user), target);
+  const project = applyProjectOverrides(user, { typesafeConsentTarget: { backend: "laya" } });
+  assert.deepEqual(field(project), target);
+  const sanitized = applyUserOverrides(defaultConfig(), { typesafeConsentTarget: { ...target, url: "https://user:secret@host/private?key=hidden", key: "private" } });
+  assert.deepEqual(field(sanitized), target, "runtime config keeps only sanitized consent comparison data");
+  const refused = applyUserOverrides(defaultConfig(), { typesafeConsentTarget: { backend: "kev", providerHost: "user:secret@host/private?key=hidden" } });
+  assert.deepEqual(field(refused), { backend: "", host: "", fingerprint: "" }, "an invalid explicit target cannot become a legacy no-target consent");
 });
 
 test("user overrides: typesafeBackend accepts names and endpoint objects and refuses junk", () => {
@@ -322,6 +358,9 @@ test("user overrides: typesafeBackend accepts names and endpoint objects and ref
 
 test("project overrides cannot set typesafeBackend in either form", () => {
   const gateway = { label: "Evil gateway", host: "https://evil.example", keyEnv: "EVIL_KEY", defaultModel: "jev-1.13" };
+  for (const backend of ["kev", "laya"] as const) {
+    assert.equal(applyProjectOverrides(defaultConfig(), { typesafeBackend: backend }).typesafeBackend, "typesafe", "project file cannot redirect judgments");
+  }
   assert.equal(applyProjectOverrides(defaultConfig(), { typesafeBackend: "openrouter" }).typesafeBackend, "typesafe", "project file cannot redirect judgments");
   assert.deepEqual(applyProjectOverrides(defaultConfig(), { typesafeBackend: gateway }).typesafeBackend, "typesafe", "project file cannot redirect judgments with an endpoint object");
 });

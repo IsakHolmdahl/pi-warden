@@ -1,4 +1,5 @@
-import { ask, noul } from "pi-typesafe";
+import { noul } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { IntegrationErrorCode, Judge } from "pi-typesafe";
 import type { ProseConfig } from "./config.js";
 import { redact } from "./redact.js";

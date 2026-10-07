@@ -1,0 +1,36 @@
+services:
+  kev:
+    build:
+      context: .
+      dockerfile: Dockerfile.kev
+    environment:
+      KEV_HOST: 0.0.0.0
+      KEV_PORT: "3000"
+      KEV_BACKEND: ${KEV_BACKEND:-openai}
+      KEV_MODEL: ${KEV_MODEL:-kev-latest}
+      KEV_OPENAI_BASE_URL: ${KEV_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      KEV_OPENAI_API_KEY: ${KEV_OPENAI_API_KEY:-}
+      KEV_OPENAI_MODEL: ${KEV_OPENAI_MODEL:-gpt-4o-mini}
+      KEV_API_KEY: ${KEV_API_KEY:-}
+    ports:
+      - "127.0.0.1:3000:3000"
+  laya:
+    build:
+      context: .
+      dockerfile: Dockerfile.laya
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      LAYA_HOST: 0.0.0.0
+      LAYA_PORT: "8000"
+      LAYA_DEVICE: ${LAYA_DEVICE:-cpu}
+      LAYA_API_KEY: ${LAYA_API_KEY:-}
+      LAYA_PRELOAD: ${LAYA_PRELOAD:-}
+      LAYA_MODELS: ${LAYA_MODELS:-}
+      LAYA_THREADS: ${LAYA_THREADS:-}
+    ports:
+      - "127.0.0.1:8100:8000"
+    volumes:
+      - laya-model-cache:/root/.cache/huggingface
+volumes:
+  laya-model-cache:

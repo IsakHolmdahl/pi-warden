@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { ask, noul, score } from "pi-typesafe";
+import { noul, score } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { IntegrationErrorCode, Judge } from "pi-typesafe";
 import type { StuckGuardConfig } from "./config.js";
 import { buildStuckEvidence, editDiff } from "./evidence.js";

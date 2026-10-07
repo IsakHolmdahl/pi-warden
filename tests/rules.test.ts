@@ -211,6 +211,16 @@ test("buildRulesRequest: one Choice per applicable rule, the rule text in the qu
   assert.equal(aggregate.state.rules, "Always write tests.");
 });
 
+test("the edit-locator choice stays below Laya's warned calibration bucket", () => {
+  const edits = Array.from({ length: 12 }, (_, index) => ({ oldText: "no match", newText: `change_${index};` }));
+  const target = describeTarget("edit", { path: "src/user.ts", edits }, cwd)!;
+  const request = buildRulesRequest(target, { sources: [], rules: [], alwaysDropped: 0 });
+  const locator = request.questions[LOCATOR_QUESTION] as { criteria: Record<string, string> };
+  assert.equal(target.edits?.length, 6);
+  assert.equal(Object.keys(locator.criteria).length, 6);
+  assert.ok(Object.keys(locator.criteria).length < 11);
+});
+
 test("parseRules: threshold and severity headers parse in any order with paths:, a bad value is ignored and warned about", () => {
   const md = [
     "# High cutoff",

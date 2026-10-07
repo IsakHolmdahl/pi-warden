@@ -5,7 +5,7 @@ import { redact } from "./redact.js";
 import { DEFAULT_TEMPLATES } from "./widget.js";
 
 /** The config layout this extension build expects; compared with the loaded config module's CONFIG_SCHEMA. */
-export const EXPECTED_SCHEMA = 12;
+export const EXPECTED_SCHEMA = 14;
 
 export interface ShapeResult {
   config: WardenConfig;
@@ -40,10 +40,12 @@ export function completeConfig(loaded: Partial<WardenConfig> | undefined): Shape
   const config: WardenConfig = {
     enabled: source.enabled ?? true,
     typesafe: source.typesafe ?? false,
+    typesafeConsentTarget: source.typesafeConsentTarget,
     typesafeBackend: backend.typesafeBackend,
     backendRefusal: backend.backendRefusal,
     mode: isMode(source.mode) ? source.mode : "steer",
     timeoutMs: source.timeoutMs ?? 5000,
+    layaTimeoutMs: source.layaTimeoutMs ?? 60_000,
     maxRequests: source.maxRequests ?? 500,
     steerVisible: source.steerVisible ?? false,
     notices: source.notices ?? false,

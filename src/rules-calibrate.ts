@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { ask } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { Judge } from "pi-typesafe";
 import type { RulesConfig } from "./config.js";
 import { redact } from "./redact.js";

@@ -3,7 +3,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { ask, choice } from "pi-typesafe";
+import { choice } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { Judge } from "pi-typesafe";
 import type { RulesConfig } from "./config.js";
 import {

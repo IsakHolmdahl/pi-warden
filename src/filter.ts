@@ -1,4 +1,5 @@
-import { ask, score } from "pi-typesafe";
+import { score } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { JsonValue, Judge } from "pi-typesafe";
 import type { JudgmentsOffReason } from "./backend.js";
 import type { FilterConfig } from "./config.js";

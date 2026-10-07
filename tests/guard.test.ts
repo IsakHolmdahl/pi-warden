@@ -1309,6 +1309,7 @@ test("the regret question rides the request with last turn's allowed calls; a lo
   assert.ok(sent.every(action => action.command.length < 340), "commands are truncated");
   const locator = (request.questions as { regret_target?: { criteria: Record<string, string> } }).regret_target;
   assert.deepEqual(Object.keys(locator?.criteria ?? {}), sent.map(action => action.id));
+  assert.ok(Object.keys(locator?.criteria ?? {}).length < 11, "the dynamic choice stays below Laya's warned bucket");
 
   const calls: unknown[] = [];
   const j: Judge = {

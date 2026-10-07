@@ -7,7 +7,8 @@
  * each section in its own fence (tool output inside a fence marked untrusted); the rest become one line. Nothing here
  * writes prose about the session, so nothing in the summary is a paraphrase. Any failure returns a reason instead, and the caller lets Pi's summary run.
  */
-import { ask, fanOut, noul } from "pi-typesafe";
+import { fanOut, noul } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { JsonValue, Judge, NoulQuestion } from "pi-typesafe";
 import { redact } from "./redact.js";
 import type { CompactionConfig } from "./config.js";

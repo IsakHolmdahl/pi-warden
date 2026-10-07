@@ -1,7 +1,8 @@
 import { readFileSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { ask, choice } from "pi-typesafe";
+import { choice } from "pi-typesafe";
+import { askJudgment as ask } from "./judgment-ask.js";
 import type { IntegrationErrorCode, Judge } from "pi-typesafe";
 import type { RulesConfig } from "./config.js";
 import { redact } from "./redact.js";

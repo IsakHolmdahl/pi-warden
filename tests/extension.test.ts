@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, beforeEach, test, type TestContext } from "node:test";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { Extension, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import { initSchema, queryHoldsForProject } from "../src/learning.js";
+import { consentTargetForBackend } from "../src/backend.js";
 import { readRulesLog, rulesLogPath } from "../src/rules-log.js";
-import { defaultConfig } from "../src/config.js";
+import { defaultConfig, loadConfig } from "../src/config.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
 import { _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
@@ -186,6 +188,72 @@ const writeConfig = (json: string) => {
   return writeFile(configPath(), JSON.stringify({ ...config, action: { ...FULL_ACTION, ...(config.action ?? {}) } }));
 };
 const grantConsent = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: false }, ...STACK_BAR }));
+async function loadIsolatedExtension(): Promise<Extension> {
+  const loader = new DefaultResourceLoader({ cwd: temporary, agentDir: join(temporary, "agent"), settingsManager: SettingsManager.inMemory(), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [resolve("src/extension.ts")] });
+  await loader.reload();
+  const result = loader.getExtensions();
+  assert.deepEqual(result.errors, []);
+  const loaded = result.extensions[0];
+  assert.ok(loaded);
+  result.runtime.sendMessage = (message, options) => { sentMessages.push({ message: message as { customType: string; content: string }, ...(options ? { options: options as Record<string, unknown> } : {}) }); };
+  result.runtime.sendUserMessage = content => { sentUserMessages.push(typeof content === "string" ? content : JSON.stringify(content)); };
+  return loaded;
+}
+const stubLocalHealthFetch = (ctx: TestContext, judgments?: string[]) => {
+  const fetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/health")) return new Response(null, { status: 200 });
+    if (url.endsWith("/v1/systemone")) judgments?.push(String(init?.body));
+    return fetch(input, init);
+  };
+  ctx.after(() => { globalThis.fetch = fetch; });
+};
+const stubBackendFetch = (ctx: TestContext, calls: string[]) => {
+  const fetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    calls.push(url);
+    return url.endsWith("/health") ? new Response(null, { status: 200 }) : fetch(input, init);
+  };
+  ctx.after(() => { globalThis.fetch = fetch; });
+};
+const setKevProvider = (url: string) => {
+  const names = ["KEV_OPENAI_BASE_URL", "KEV_BACKEND", "KEV_MODEL", "KEV_OPENAI_MODEL"];
+  const previous = names.map(name => process.env[name]);
+  [process.env.KEV_OPENAI_BASE_URL, process.env.KEV_BACKEND, process.env.KEV_MODEL, process.env.KEV_OPENAI_MODEL] = [url, "openai", "kev-latest", "gpt-4o-mini"];
+  return () => names.forEach((name, index) => previous[index] === undefined ? delete process.env[name] : process.env[name] = previous[index]);
+};
+const kevConsentTarget = (baseUrl: string) => {
+  const restore = setKevProvider(baseUrl);
+  try { return consentTargetForBackend("kev"); }
+  finally { restore(); }
+};
+const stubProcessLaunches = (ctx: TestContext, allowExecFile = false, execFileDelayMs = 0, execFileResults: Array<Error | null> = []) => {
+  const names = ["spawn", "execFile", "execFileSync", "spawnSync", "execSync"];
+  const api = childProcess as unknown as Record<string, unknown>;
+  const originals = names.map(name => [name, api[name]] as const);
+  const calls: unknown[][] = [];
+  let composeCalls = 0;
+  for (const name of names) api[name] = (...args: unknown[]) => {
+    const isCompose = name === "execFile" && args[0] === "docker" && Array.isArray(args[1]) && args[1].includes("compose");
+    if (isCompose) calls.push([name, ...args]);
+    if (allowExecFile && name === "execFile") {
+      const callback = args.at(-1);
+      if (typeof callback === "function") {
+        const complete = callback as (...result: unknown[]) => void;
+        const error = isCompose ? execFileResults[composeCalls++] ?? null : null;
+        if (execFileDelayMs > 0) setTimeout(complete, execFileDelayMs, error, "", "");
+        else queueMicrotask(() => complete(error, "", ""));
+      }
+      return { pid: 1, kill() {} };
+    }
+    throw new Error(`unexpected process launch: ${name}`);
+  };
+  syncBuiltinESMExports();
+  ctx.after(() => { for (const [name, original] of originals) api[name] = original; syncBuiltinESMExports(); });
+  return calls;
+};
 /** Consent with the rules guard on: the turn-start reminder needs a rule set to ask about. */
 const curatorConfig = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: true }, slop: { enabled: false }, done: { enabled: false }, ...STACK_BAR }));
 
@@ -292,6 +360,151 @@ test("PI_WARDEN_DB is set and not under the real home directory", () => {
   assert.ok(dbPath, "PI_WARDEN_DB must be set before extension tests run");
   const home = homedir();
   assert.ok(!dbPath.startsWith(home), `PI_WARDEN_DB (${dbPath}) must not be under the real home directory (${home})`);
+});
+
+test("legacy Jev consent without a destination target keeps its existing client", async t => {
+  const launches = stubProcessLaunches(t);
+  await grantConsent();
+  const saved = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+  assert.equal(saved.typesafeConsentTarget, undefined);
+  await sessionStart();
+  await toolCall("bash", { command: "npm test" });
+  assert.deepEqual(launches, []);
+  assert.equal(requestUrls.length, 1);
+  assert.match(requestUrls[0]!, /api\.typesafe\.ai/);
+});
+
+test("an invalid explicit default-backend target does not fall back to legacy consent", async () => {
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeConsentTarget: { backend: "typesafe", host: "user:secret@api.typesafe.ai/private?key=hidden" }, rules: { enabled: false }, ...STACK_BAR }));
+  await sessionStart();
+  await toolCall("bash", { command: "npm test" });
+  assert.equal(networkCalls, 0, "an invalid present target is not treated as the legacy absent target");
+  await runCommand("status");
+  assert.match(notices.at(-1)!.text, /TypeSafe judgments not consented \(run \/warden enable\)/);
+});
+
+test("a local backend does not start before consent", async t => {
+  const launches = stubProcessLaunches(t);
+  await writeConfig(JSON.stringify({ typesafe: false, typesafeBackend: "kev", rules: { enabled: false }, ...STACK_BAR }));
+  await sessionStart();
+  await toolCall("bash", { command: "npm test" });
+  assert.deepEqual(launches, []);
+  assert.equal(requestUrls.length, 0);
+});
+
+test("local judgments need no Jev key and respect the session request budget", async t => {
+  stubLocalHealthFetch(t);
+  const launches = stubProcessLaunches(t, true);
+  const saved = process.env.TYPESAFE_API_KEY;
+  const restoreProvider = setKevProvider("https://api.openai.com/v1");
+  delete process.env.TYPESAFE_API_KEY;
+  try {
+    await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "kev", typesafeConsentTarget: kevConsentTarget("https://api.openai.com/v1"), maxRequests: 1, rules: { enabled: false }, ...STACK_BAR }));
+    await sessionStart();
+    await toolCall("bash", { command: "npm test" });
+    await toolCall("bash", { command: "npm run lint" });
+    assert.equal(requestUrls.filter(url => url.endsWith("/v1/systemone")).length, 1);
+    assert.equal(launches.length, 1, "the selected local backend is started once");
+    assert.ok(requestUrls.every(url => !url.includes("api.typesafe.ai")), "local judgments never use Jev as a fallback");
+  } finally {
+    restoreProvider();
+    if (saved === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = saved;
+  }
+});
+
+test("local startup does not consume the first System One request timeout", async t => {
+  const previousExtension = extension;
+  const previousCommand = command;
+  extension = await loadIsolatedExtension();
+  const registered = extension.commands.get("warden");
+  assert.ok(registered);
+  command = registered;
+  stubProcessLaunches(t, true, 100);
+  const mockFetch = globalThis.fetch;
+  const originalTimeout = AbortSignal.timeout;
+  const timeoutValues: number[] = [];
+  AbortSignal.timeout = milliseconds => { timeoutValues.push(milliseconds); return originalTimeout(milliseconds); };
+  const events: string[] = [];
+  let postSignalWasLive = false;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).endsWith("/health")) { events.push("health"); await new Promise(resolve => setTimeout(resolve, 100)); return new Response(null, { status: 200 }); }
+    if (init?.method === "POST") { events.push("post"); postSignalWasLive = !!init.signal && !init.signal.aborted; }
+    return mockFetch(input, init);
+  };
+  try {
+    await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "laya", typesafeConsentTarget: consentTargetForBackend("laya"), timeoutMs: 50, layaTimeoutMs: 7000, rules: { enabled: false }, ...STACK_BAR }));
+    await sessionStart();
+    await toolCall("bash", { command: "npm test" });
+    assert.deepEqual(events, ["health", "post"], "the POST follows successful readiness");
+    assert.equal(postSignalWasLive, true, "the per-request deadline starts after startup");
+    assert.ok(timeoutValues.includes(7000), "Laya uses its explicit inference timeout rather than the shared 50 ms timeout");
+    assert.equal(requestUrls.filter(url => url.endsWith("/v1/systemone")).length, 1, "the mocked POST succeeds");
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+    globalThis.fetch = mockFetch;
+    extension = previousExtension;
+    command = previousCommand;
+  }
+});
+
+test("/warden enable persists Kev comparison data without raw provider URL or API key", async () => {
+  const providerUrl = "https://url-user-fixture:url-password-fixture@kev-consent.fixture.invalid/private/path-fixture?profile=query-fixture&api_key=url-api-key-fixture";
+  const previousApiKey = process.env.KEV_OPENAI_API_KEY;
+  process.env.KEV_OPENAI_API_KEY = "kev-api-key-fixture";
+  const restore = setKevProvider(providerUrl);
+  try {
+    await writeConfig(JSON.stringify({ typesafeBackend: "kev", rules: { enabled: false }, ...STACK_BAR }));
+    await sessionStart();
+    await runCommand("enable");
+    const saved = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+    assert.equal(saved.typesafe, true, "the consent flag is persisted with its target");
+    assert.deepEqual(saved.typesafeConsentTarget, kevConsentTarget(providerUrl));
+    const serialized = JSON.stringify(saved.typesafeConsentTarget);
+    assert.doesNotMatch(serialized, /https?:\/\/|url-user-fixture|url-password-fixture|path-fixture|profile=query-fixture|url-api-key-fixture|kev-api-key-fixture/);
+  } finally {
+    restore();
+    if (previousApiKey === undefined) delete process.env.KEV_OPENAI_API_KEY; else process.env.KEV_OPENAI_API_KEY = previousApiKey;
+  }
+});
+
+test("changed Kev provider refuses judgments until consent is renewed", async t => {
+  const launches = stubProcessLaunches(t, true);
+  const calls: string[] = [];
+  stubBackendFetch(t, calls);
+  const restore = setKevProvider("https://kev-new.fixture.invalid/v1?profile=offline");
+  try {
+    await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "kev", typesafeConsentTarget: kevConsentTarget("https://kev-old.fixture.invalid/v1?profile=offline"), rules: { enabled: false }, ...STACK_BAR }));
+    await sessionStart();
+    assert.equal(loadConfig({ cwd: temporary }).typesafeBackend, "kev", "the stale consent fixture selects a supported backend");
+    await runCommand("status");
+    assert.match(notices.at(-1)!.text, /kev local judgments not consented \(run \/warden enable\)/i);
+    assert.doesNotMatch(notices.at(-1)!.text, /consented via \/warden enable/);
+    await toolCall("bash", { command: "npm test" });
+    assert.equal(launches.length, 0, "stale consent must prevent Compose startup");
+    assert.equal(calls.length, 0, "stale consent must prevent local API requests");
+    assert.match(notices.map(entry => entry.text).join("\n"), /kev local judgments are off \(no consent\)/i);
+    await runCommand("enable");
+    await sessionStart();
+    await toolCall("bash", { command: "npm test" });
+    assert.ok(calls.some(url => url.endsWith("/health")), "renewed consent allows only the fake local readiness check");
+    assert.ok(calls.some(url => url.endsWith("/v1/systemone")));
+  } finally { restore(); }
+});
+
+test("switching backend invalidates a Kev consent target", async t => {
+  const launches = stubProcessLaunches(t, true);
+  const calls: string[] = [];
+  stubBackendFetch(t, calls);
+  const restore = setKevProvider("https://kev-consent.fixture.invalid/v1");
+  try {
+    await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "laya", typesafeConsentTarget: kevConsentTarget("https://kev-consent.fixture.invalid/v1"), rules: { enabled: false }, ...STACK_BAR }));
+    await sessionStart();
+    assert.equal(loadConfig({ cwd: temporary }).typesafeBackend, "laya", "the switched-backend fixture is supported");
+    await toolCall("bash", { command: "npm test" });
+    assert.equal(launches.length, 0, "a switched backend must not start Compose");
+    assert.equal(calls.length, 0, "a switched backend must not reach the local API");
+    assert.match(notices.map(entry => entry.text).join("\n"), /laya local judgments are off \(no consent\)/i);
+  } finally { restore(); }
 });
 
 test("should-proceed defaults to trace-only for interactive and headless agents", async () => {
@@ -2510,7 +2723,7 @@ test("/warden status, enable, disable, and test report and persist consent", asy
 
   confirmResult = true;
   await runCommand("enable");
-  assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: true });
+  assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: true, typesafeConsentTarget: consentTargetForBackend("typesafe") });
   assert.match(notices.at(-1)!.text, /enabled and saved/);
 
   await runCommand("test");
@@ -2596,7 +2809,7 @@ test("/warden enable without a key asks for one after consent, verifies it, stor
     keyInput = "ts_live_key_0123456789abcdef";
     await runCommand("enable");
     assert.equal(modelListCalls, 1);
-    assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: true });
+    assert.deepEqual(JSON.parse(await readFile(configPath(), "utf8")), { typesafe: true, typesafeConsentTarget: consentTargetForBackend("typesafe") });
     assert.deepEqual(JSON.parse(await readFile(storedKeyPath, "utf8")), { apiKey: keyInput });
     assert.match(notices.at(-1)!.text, /key verified \(1 model\) and stored at/);
     assert.ok(notices.every(notice => !notice.text.includes("ts_live_key")), "the key is never echoed");
@@ -4455,7 +4668,7 @@ test("judgments off: each reason is said once per session with its fix, and work
 });
 
 test("judgments off: no key on OpenRouter names only its variable, since /typesafe login stores no OpenRouter key", async () => {
-  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "openrouter", rules: { enabled: false }, ...STACK_BAR }));
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "openrouter", typesafeConsentTarget: consentTargetForBackend("openrouter"), rules: { enabled: false }, ...STACK_BAR }));
   const savedOpenRouter = process.env.OPENROUTER_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   try {
@@ -4470,7 +4683,7 @@ test("judgments off: no key on OpenRouter names only its variable, since /typesa
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
 
 test("the commandcode backend sends judgments to its own host, path, and model", async () => {
-  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "commandcode", rules: { enabled: false }, ...STACK_BAR }));
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: "commandcode", typesafeConsentTarget: consentTargetForBackend("commandcode"), rules: { enabled: false }, ...STACK_BAR }));
   const saved = process.env.COMMANDCODE_API_KEY;
   process.env.COMMANDCODE_API_KEY = "cc-fake-test-key-000";
   try {
@@ -4485,7 +4698,7 @@ test("the commandcode backend sends judgments to its own host, path, and model",
 });
 
 test("a caller-supplied endpoint object reaches createTypeSafe unchanged and answers from its own host, model, and key", async () => {
-  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, rules: { enabled: false }, ...STACK_BAR }));
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, typesafeConsentTarget: consentTargetForBackend(gateway), rules: { enabled: false }, ...STACK_BAR }));
   process.env.ACME_JUDGE_KEY = "acme-fake-test-key-000";
   try {
     await toolCall("bash", { command: "npm test" });
@@ -4520,7 +4733,7 @@ test("judgments off: an endpoint object pi-typesafe refuses is refused with the 
 });
 
 test("a custom backend's label, host, and model are named in /warden status, the /warden enable dialog, and the /warden test confirmation", async () => {
-  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, rules: { enabled: false }, ...STACK_BAR }));
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, typesafeConsentTarget: consentTargetForBackend(gateway), rules: { enabled: false }, ...STACK_BAR }));
   process.env.ACME_JUDGE_KEY = "acme-fake-test-key-000";
   try {
     await runCommand("status");
@@ -4538,7 +4751,7 @@ test("a custom backend's label, host, and model are named in /warden status, the
 });
 
 test("judgments off: no key on a custom endpoint names its own key variable and no login", async () => {
-  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, rules: { enabled: false }, ...STACK_BAR }));
+  await writeConfig(JSON.stringify({ typesafe: true, typesafeBackend: gateway, typesafeConsentTarget: consentTargetForBackend(gateway), rules: { enabled: false }, ...STACK_BAR }));
   delete process.env.ACME_JUDGE_KEY;
   await toolCall("bash", { command: "npm test" });
   assert.deepEqual(judgmentsOff(), ["warden: Jev judgments are off (no key for Acme judge gateway). Set ACME_JUDGE_KEY."]);
