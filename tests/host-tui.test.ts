@@ -9,29 +9,17 @@
  * No network. No live host. No TypeSafe requests.
  */
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { before, after, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 
 const savedEnv: Record<string, string | undefined> = {};
-const root = join(import.meta.dirname, "..");
 let agentTemp = "";
-let packageTemp = "";
 let workTemp = "";
 
-/** Build the package into a temp dir, so extensions/index.js (which re-exports ../dist/extension.js) is loadable
- *  without writing the checkout's dist/, which a concurrent run may be loading; and point the agent directory at a
- *  temp dir so session_start never touches the developer's data. */
+/** Keep session_start away from the developer's Pi data. */
 before(() => {
-  packageTemp = mkdtempSync(join(tmpdir(), "pi-warden-tui-package-"));
-  execFileSync(process.execPath, [join(root, "node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.build.json", "--outDir", join(packageTemp, "dist")], { cwd: root, stdio: "pipe" });
-  mkdirSync(join(packageTemp, "extensions"));
-  copyFileSync(join(root, "extensions", "index.js"), join(packageTemp, "extensions", "index.js"));
-  copyFileSync(join(root, "package.json"), join(packageTemp, "package.json"));
-  symlinkSync(join(root, "node_modules"), join(packageTemp, "node_modules"), "dir");
   agentTemp = mkdtempSync(join(tmpdir(), "pi-warden-tui-"));
   workTemp = mkdtempSync(join(tmpdir(), "pi-warden-tui-work-"));
   for (const key of ["PI_CODING_AGENT_DIR", "PI_WARDEN_DB", "PI_WARDEN_TRACE_DIR", "PI_WARDEN_HOST_PATHS", "PI_WARDEN_ENABLED", "PI_WARDEN_MODE", "PI_WARDEN_INDEX_DIR"]) {
@@ -49,7 +37,7 @@ after(() => {
     const value = savedEnv[key];
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
-  for (const dir of [agentTemp, packageTemp, workTemp]) if (dir) rmSync(dir, { recursive: true, force: true });
+  for (const dir of [agentTemp, workTemp]) if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -91,8 +79,8 @@ function createHost() {
 // ---------------------------------------------------------------------------
 
 test("every guard mounts on a host whose TUI has a mouse region", async () => {
-  const ext: unknown = await import(pathToFileURL(join(packageTemp, "extensions", "index.js")).href);
-  const defaultExport = (ext as { default: (pi: unknown) => void }).default;
+  const ext = await import("../src/extension.js");
+  const defaultExport = ext.default as (pi: unknown) => void;
   const host = createHost();
   defaultExport(host.pi);
   const sessionEvent = host.events.find(e => e.type === "session_start");

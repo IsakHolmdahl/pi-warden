@@ -38,8 +38,8 @@
   },
   "files": [
     "dist",
+    "src",
     "docker",
-    "extensions",
     "examples",
     "README.md",
     "CHANGELOG.md",
@@ -47,7 +47,7 @@
   ],
   "pi": {
     "extensions": [
-      "./extensions/index.js"
+      "./src/extension.ts"
     ],
     "image": "https://raw.githubusercontent.com/DevMortimer/pi-warden/main/docs/preview.png"
   },
