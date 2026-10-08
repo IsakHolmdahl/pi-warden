@@ -4,4 +4,5 @@ ENV LAYA_HOST=0.0.0.0
 ENV LAYA_PORT=8000
 ENV LAYA_DEVICE=cpu
 EXPOSE 8000
-CMD ["laya-serve"]
+COPY laya_logging.py /usr/local/bin/laya_logging.py
+CMD ["python", "/usr/local/bin/laya_logging.py"]
